@@ -18,7 +18,6 @@ import gzip, math, os, re, struct, sys
 from io import BytesIO
 from cStringIO import StringIO
 
-
 import lz4.block
 
 uncompress = lz4.block.decompress
@@ -269,7 +268,8 @@ class NxoFileBase(object):
                 dynamic[tag].append(val)
             else:
                 dynamic[tag] = val
-        builder.add_section('.dynamic', self.dynamicoff, end=f.tell())
+        self.dynamicsize = f.tell() - self.dynamicoff
+        builder.add_section('.dynamic', self.dynamicoff, end=self.dynamicoff + self.dynamicsize)
         builder.add_section('.eh_frame_hdr', self.unwindoff, end=self.unwindend)
 
         # read .dynstr
@@ -315,7 +315,7 @@ class NxoFileBase(object):
             nbuckets, symoffset, bloom_size, bloom_shift = f.read('IIII')
             f.skip(bloom_size * self.offsize)
             buckets = [f.read('I') for i in range(nbuckets)]
-            
+
             max_symix = max(buckets) if buckets else 0
             if max_symix >= symoffset:
                 f.skip((max_symix - symoffset) * 4)
@@ -387,10 +387,11 @@ class NxoFileBase(object):
             self.rodataoff = rloc
             self.rodatasize = rsize
             self.dataoff = dloc
-        
+
         self.datasize = self.bssoff - self.dataoff
         self.bsssize = self.bssend - self.bssoff
 
+        plt_got_end = None
         if DT_JMPREL in dynamic:
             pltlocations = self.process_relocations(f, symbols, dynamic[DT_JMPREL], dynamic[DT_PLTRELSZ])
             locations |= pltlocations
@@ -422,15 +423,18 @@ class NxoFileBase(object):
                             self.plt_entries.append((off, target))
                 builder.add_section('.plt', min(self.plt_entries)[0], end=max(self.plt_entries)[0] + 0x10)
 
-            # try to find the ".got" which should follow the ".got.plt"
-            good = False
-            got_end = plt_got_end + self.offsize
-            while got_end in locations and (DT_INIT_ARRAY not in dynamic or got_end < dynamic[DT_INIT_ARRAY]):
-                good = True
-                got_end += self.offsize
+        # try to find the ".got" which should follow the ".got.plt"
+        good = False
+        got_start = (plt_got_end if plt_got_end is not None else self.dynamicoff + self.dynamicsize)
+        got_end = self.offsize + got_start
+        while (got_end in locations or plt_got_end is None) and (DT_INIT_ARRAY not in dynamic or got_end < dynamic[DT_INIT_ARRAY]):
+            good = True
+            got_end += self.offsize
 
-            if good:
-                builder.add_section('.got', plt_got_end, end=got_end)
+        if good:
+            self.got_start = got_start
+            self.got_end   = got_end
+            builder.add_section('.got', self.got_start, end=self.got_end)
 
         self.eh_table = []
         if not self.armv7:
@@ -613,44 +617,41 @@ def kip1_blz_decompress(compressed):
     compressed_size, init_index, uncompressed_addl_size = struct.unpack('<III', compressed[-0xC:])
     decompressed = compressed[:] + '\x00' * uncompressed_addl_size
     decompressed_size = len(decompressed)
-    if len(compressed) != compressed_size:
-        assert len(compressed) > compressed_size
-        compressed = compressed[len(compressed) - compressed_size:]
     if not (compressed_size + uncompressed_addl_size):
         return ''
-    compressed = map(ord, compressed)
     decompressed = map(ord, decompressed)
-    index = compressed_size - init_index
-    outindex = decompressed_size
-    while outindex > 0:
-        index -= 1
-        control = compressed[index]
+    cmp_start = len(compressed) - compressed_size
+    cmp_ofs   = compressed_size - init_index
+    out_ofs   = compressed_size + uncompressed_addl_size
+    while out_ofs > 0:
+        cmp_ofs -= 1
+        control = decompressed[cmp_start + cmp_ofs]
         for i in xrange(8):
             if control & 0x80:
-                if index < 2:
+                if cmp_ofs < 2 - cmp_start:
                     raise ValueError('Compression out of bounds!')
-                index -= 2
-                segmentoffset = compressed[index] | (compressed[index+1] << 8)
+                cmp_ofs -= 2
+                segmentoffset = decompressed[cmp_start + cmp_ofs] | (decompressed[cmp_start + cmp_ofs + 1] << 8)
                 segmentsize = ((segmentoffset >> 12) & 0xF) + 3
                 segmentoffset &= 0x0FFF
                 segmentoffset += 2
-                if outindex < segmentsize:
+                if out_ofs < segmentsize - cmp_start:
                     raise ValueError('Compression out of bounds!')
                 for j in xrange(segmentsize):
-                    if outindex + segmentoffset >= decompressed_size:
+                    if out_ofs + segmentoffset >= decompressed_size:
                         raise ValueError('Compression out of bounds!')
-                    data = decompressed[outindex+segmentoffset]
-                    outindex -= 1
-                    decompressed[outindex] = data
+                    data = decompressed[cmp_start + out_ofs + segmentoffset]
+                    out_ofs -= 1
+                    decompressed[cmp_start + out_ofs] = data
             else:
-                if outindex < 1:
+                if out_ofs < 1 - cmp_start:
                     raise ValueError('Compression out of bounds!')
-                outindex -= 1
-                index -= 1
-                decompressed[outindex] = compressed[index]
+                out_ofs -= 1
+                cmp_ofs -= 1
+                decompressed[cmp_start + out_ofs] = decompressed[cmp_start + cmp_ofs]
             control <<= 1
             control &= 0xFF
-            if not outindex:
+            if not out_ofs:
                 break
     return ''.join(map(chr, decompressed))
 
@@ -721,7 +722,7 @@ def looks_like_memory_dump(fileobj):
         if fileobj.read(4) == 'MOD0':
             return True
     return False
-            
+
 
 def load_nxo(fileobj):
     fileobj.seek(0)
