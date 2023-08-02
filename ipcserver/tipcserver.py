@@ -233,6 +233,7 @@ class IPCServerSimulator(Nx64Simulator):
         self.hipc_header    = None
         self.special_header = None
         self.last_cmp       = None
+        self.tail_call      = False
         self.msg_buf_regs   = []
         self.cmd_id_regs    = []
         self.cmd_id_ofs     = []
@@ -250,6 +251,10 @@ class IPCServerSimulator(Nx64Simulator):
 
     def trace_tipc_insn(self, uc, insn):
         parts = insn.op_str.replace(',', ' ').replace('[', ' ').replace(']', ' ').split()
+        if insn.mnemonic in ['ldr', 'ldp'] and (parts[0] == 'x30' or parts[1] == 'x30'):
+            self.tail_call = True
+        # parse out
+        #print self.tail_call, insn.mnemonic, insn.op_str
         if insn.mnemonic == 'mrs' and parts[-1] == 'tpidrro_el0':
             self.msg_buf_regs.append(parts[0])
         elif insn.mnemonic == 'ldrh':
@@ -305,7 +310,7 @@ class IPCServerSimulator(Nx64Simulator):
             reg_idx = int(parts[0][1:])
             if parts[0] in self.msg_buf_regs:
                 self.msg_buf_regs.remove(parts[0])
-                print 'no longer %s' % parts[0]
+                #print 'no longer %s' % parts[0]
             if reg_idx in self.cmd_id_regs:
                 dst_idx = self.cmd_id_regs.index(reg_idx)
                 if int(parts[1][1:]) in self.cmd_id_regs:
@@ -367,6 +372,16 @@ class IPCServerSimulator(Nx64Simulator):
                 else:
                     print 'Unknown command id comparison %s' % insn.mnemonic
                     assert False
+        elif insn.mnemonic == 'b':
+            if self.tail_call:
+                #print '!!! default'
+                # Verify we're default
+                assert uc.mem_read(self.message_ptr, 8) == '\x0F\x00\x02\x03\x04\x05\x06\x07'
+                self.found_default = True
+                self.default_func  = self.get_val_or_reg(uc, parts[0])
+                #print '!!! default func %x' % self.default_func
+                uc.mem_write(uc.reg_read(UC_ARM64_REG_PC), b'\xC0\x03\x5F\xD6')
+                uc.reg_write(UC_ARM64_REG_X0, 0xFEED9A62)
         elif insn.mnemonic == 'bl':
             # nop out
             if uc.mem_read(self.message_ptr, 8) == '\x0F\x00\x02\x03\x04\x05\x06\x07':
