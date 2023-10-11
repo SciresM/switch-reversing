@@ -17,6 +17,10 @@ def load_nxo_to_unicorn(uc, f, loadbase):
     f.binfile.seek(0)
     resultw.write(f.binfile.read_to_end())
 
+    def read_qword(ea):
+        resultw.seek(ea - loadbase)
+        return struct.unpack('<Q', resultw.read(8))[0]
+
     def write_qword(ea, val):
         resultw.seek(ea - loadbase)
         resultw.write(struct.pack('<Q', val))
@@ -40,12 +44,16 @@ def load_nxo_to_unicorn(uc, f, loadbase):
                 #assert sym.shndx # huge mess if we do this on an extern
                 newval += addend
             write_qword(ea, newval)
+        elif r_type == nxo64.R_FAKE_RELR:
+            assert not f.armv7 # TODO
+            addend = read_qword(ea)
+            write_qword(ea, addend + loadbase)
         else:
             print 'TODO: r_type=0x%x sym=%r ea=%X addend=%X' % (r_type, sym, ea, addend)
             continue
 
     binary = resultw.getvalue()
-    uc.mem_map(loadbase, (max(len(binary),f.bssend) + 0xFFF) & ~0xFFF) 
+    uc.mem_map(loadbase, (max(len(binary),f.bssend) + 0xFFF) & ~0xFFF)
     uc.mem_write(loadbase, binary)
 
 def create_unicorn_arm64(): # enables float

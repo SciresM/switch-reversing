@@ -87,6 +87,9 @@ class BinFile(object):
  DT_RELAENT, DT_STRSZ, DT_SYMENT, DT_INIT, DT_FINI, DT_SONAME, DT_RPATH, DT_SYMBOLIC, DT_REL,
  DT_RELSZ, DT_RELENT, DT_PLTREL, DT_DEBUG, DT_TEXTREL, DT_JMPREL, DT_BIND_NOW, DT_INIT_ARRAY,
  DT_FINI_ARRAY, DT_INIT_ARRAYSZ, DT_FINI_ARRAYSZ, DT_RUNPATH, DT_FLAGS) = xrange(31)
+
+DT_RELRSZ, DT_RELR, DT_RELRENT = 0x23, 0x24, 0x25
+
 DT_GNU_HASH = 0x6ffffef5
 DT_VERSYM = 0x6ffffff0
 DT_RELACOUNT = 0x6ffffff9
@@ -109,6 +112,8 @@ R_ARM_TLS_DESC = 13
 R_ARM_GLOB_DAT = 21
 R_ARM_JUMP_SLOT = 22
 R_ARM_RELATIVE = 23
+
+R_FAKE_RELR = -1
 
 R_AARCH64_ABS64 = 257
 R_AARCH64_GLOB_DAT = 1025
@@ -286,6 +291,7 @@ class NxoFileBase(object):
             (DT_FINI_ARRAY, DT_FINI_ARRAYSZ, '.fini_array'),
             (DT_RELA, DT_RELASZ, '.rela.dyn'),
             (DT_REL, DT_RELSZ, '.rel.dyn'),
+            (DT_RELR, DT_RELRSZ, '.relr.dyn'),
             (DT_JMPREL, DT_PLTRELSZ, ('.rel.plt' if self.armv7 else '.rela.plt')),
         ]:
             if startkey in dynamic and szkey in dynamic:
@@ -349,6 +355,9 @@ class NxoFileBase(object):
 
         if DT_RELA in dynamic:
             locations |= self.process_relocations(f, symbols, dynamic[DT_RELA], dynamic[DT_RELASZ])
+
+        if DT_RELR in dynamic:
+            locations |= self.process_relocations_relr(f, dynamic[DT_RELR], dynamic[DT_RELRSZ])
 
         if segment_data is None:
             # infer segment info
@@ -421,15 +430,17 @@ class NxoFileBase(object):
                         target = paddr + poff
                         if plt_got_start <= target < plt_got_end:
                             self.plt_entries.append((off, target))
-                builder.add_section('.plt', min(self.plt_entries)[0], end=max(self.plt_entries)[0] + 0x10)
+                if len(self.plt_entries) > 0:
+                    builder.add_section('.plt', min(self.plt_entries)[0], end=max(self.plt_entries)[0] + 0x10)
 
         # try to find the ".got" which should follow the ".got.plt"
         good = False
         got_start = (plt_got_end if plt_got_end is not None else self.dynamicoff + self.dynamicsize)
         got_end = self.offsize + got_start
-        while (got_end in locations or plt_got_end is None) and (DT_INIT_ARRAY not in dynamic or got_end < dynamic[DT_INIT_ARRAY]):
+        while (got_end in locations or (plt_got_end is None and got_end < dynamic[DT_INIT_ARRAY])) and (DT_INIT_ARRAY not in dynamic or got_end < dynamic[DT_INIT_ARRAY] or dynamic[DT_INIT_ARRAY] < got_start):
             good = True
             got_end += self.offsize
+            #print 'got_start got_end %X %X %s %X' % (got_start, got_end, str(got_end in locations), dynamic[DT_INIT_ARRAY])
 
         if good:
             self.got_start = got_start
@@ -524,6 +535,29 @@ class NxoFileBase(object):
             if r_type != R_AARCH64_TLSDESC and r_type != R_ARM_TLS_DESC:
                 locations.add(offset)
             self.relocations.append((offset, r_type, sym, addend))
+        return locations
+
+    def process_relocations_relr(self, f, offset, size):
+        locations = set()
+        f.seek(offset)
+        relocsize = 8
+        for i in xrange(size / relocsize):
+            entry = f.read('Q')
+            if entry & 1:
+                entry >>= 1
+                i = 0
+                while i < (relocsize * 8) - 1:
+                    if entry & (1 << i):
+                        locations.add(where + i * relocsize)
+                        self.relocations.append((where + i * relocsize, R_FAKE_RELR, None, 0))
+                    i += 1
+                where += relocsize * ((relocsize * 8) - 1)
+            else:
+                # Where
+                where = entry
+                locations.add(where)
+                self.relocations.append((where, R_FAKE_RELR, None, 0))
+                where += relocsize
         return locations
 
     def get_dynstr(self, o):
@@ -994,6 +1028,12 @@ else:
                     got_name_lookup[offset] = sym.name
             elif r_type == R_AARCH64_RELATIVE:
                 idaapi.put_qword(target, loadbase + addend)
+                if addend < f.textsize:
+                    funcs.add(loadbase + addend)
+            elif r_type == R_FAKE_RELR:
+                assert not f.armv7 # TODO
+                addend = idaapi.get_qword(target)
+                idaapi.put_qword(target, addend + loadbase)
                 if addend < f.textsize:
                     funcs.add(loadbase + addend)
             else:

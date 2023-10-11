@@ -866,6 +866,8 @@ def dump_ipc_filename(fname):
     for offset, r_type, sym, addend in f.relocations:
         if offset < got[0] or got[1] < offset:
             continue
+        if r_type == nxo64.R_FAKE_RELR:
+            addend = simulator.qword(0x7100000000 + offset) - 0x7100000000
         if f.dataoff <= offset < f.dataoff + f.datasize:
             if sym and sym.shndx and sym.value < f.textsize:
                 fptr_syms[offset] = sym.value
@@ -960,6 +962,9 @@ def dump_ipc_filename(fname):
         candidates = []
         for offset, r_type, sym, addend in f.relocations:
             if addend:
+                candidates.append((addend, offset))
+            elif r_type == nxo64.R_FAKE_RELR:
+                addend = simulator.qword(0x7100000000 + offset) - 0x7100000000
                 candidates.append((addend, offset))
         candidates.sort()
 
