@@ -3,6 +3,7 @@ import sys
 import re
 import bisect
 import hashlib
+import binascii
 from functools import partial
 
 from unicorn import *
@@ -327,6 +328,7 @@ UC_REG_BY_NAME = {
     "x8": UC_ARM64_REG_X8,
     "x9": UC_ARM64_REG_X9,
     "x10": UC_ARM64_REG_X10,
+    "x22": UC_ARM64_REG_X22,
     "x23": UC_ARM64_REG_X23,
     "x24": UC_ARM64_REG_X24,
     "x25": UC_ARM64_REG_X25,
@@ -456,8 +458,9 @@ class BranchTracer(object):
                 del self.taint_offsets[spoiled]
         if instruction.mnemonic == 'ldrh' and instruction.op_str.endswith(', lsl #1]') and int(parts[2][1:]) in self.taints:
             self.range_top = min(self.range_top, self.cmd_id) # TODO
-        if instruction.mnemonic == 'ldrb' and int(parts[2][1:]) in self.taints:
-            self.range_top = min(self.range_top, self.cmd_id) # TODO
+        if instruction.mnemonic == 'ldrb':
+            if len(parts) > 2 and int(parts[2][1:]) in self.taints:
+                self.range_top = min(self.range_top, self.cmd_id) # TODO
 
 
         # TODO: is this sound?
@@ -492,38 +495,76 @@ class IPCServerTrace(object):
 
     def PrepareForProcess(self, uc):
         arg = uc.reg_read(UC_ARM64_REG_X1)
-        metainfo_size = 0x90
-        metainfo_bytes = uc.mem_read(arg, metainfo_size)
-        metainfo = list(struct.unpack('<' + 'I' * (metainfo_size/4), metainfo_bytes))
+        if not (self._simulator.stack.base <= arg < self._simulator.stack.base + self._simulator.stack.size):
+            # 19.0.0 0x22 descriptor in .rodata
+            metainfo_size = 0x22
+            metainfo_bytes = uc.mem_read(arg, metainfo_size)
+            metainfo = list(struct.unpack('<HHBBBBBB'+('B'*24), metainfo_bytes))
+            #print(metainfo)
+            #print binascii.hexlify(metainfo_bytes)
 
-        self.bytes_in = metainfo[8/4] - 0x10
-        assert 0 <= self.bytes_in <= 0x1000
-        self.bytes_out = metainfo[0x10/4] - 0x10
-        assert 0 <= self.bytes_out <= 0x1000
-        self.buffer_count = metainfo[0x18/4]
-        assert self.buffer_count < 20
+            self.bytes_in = metainfo[0] - 0x10
+            assert 0 <= self.bytes_in <= 0x1000
+            self.bytes_out = metainfo[1] - 0x10
+            assert 0 <= self.bytes_out <= 0x1000
+            self.buffer_count = metainfo[3]
+            assert self.buffer_count < 20
 
-        self.in_interface_count = metainfo[0x1c/4]
-        self.out_interface_count = metainfo[0x20/4]
-        self.in_handles_count = metainfo[0x24/4]
-        self.out_handles_count = metainfo[0x28/4]
+            self.in_interface_count = metainfo[4]
+            self.out_interface_count = metainfo[5]
+            self.in_handles_count = metainfo[6]
+            self.out_handles_count = metainfo[7]
 
-        assert self.in_interface_count < 20
-        assert self.out_interface_count < 20
-        assert self.in_handles_count < 20
-        assert self.out_handles_count < 20
+            assert self.in_interface_count <= 8
+            assert self.out_interface_count <= 8
+            assert self.in_handles_count <= 8
+            assert self.out_handles_count <= 8
 
-        self.description = {
-            'inbytes': self.bytes_in,
-            'outbytes': self.bytes_out,
-            'ininterfaces': [None] * self.in_interface_count,
-            'outinterfaces': [None] * self.out_interface_count,
-            'inhandles': metainfo[0x4C/4:0x4C/4 + self.in_handles_count],
-            'outhandles': metainfo[0x6C/4:0x6C/4 + self.out_handles_count],
-            'buffers': metainfo[0x2c/4:0x2c/4 + self.buffer_count],
-            'buffer_entry_sizes': [0]*self.buffer_count,
-            'pid': metainfo[0] == 1,
-        }
+            self.description = {
+                'inbytes': self.bytes_in,
+                'outbytes': self.bytes_out,
+                'ininterfaces': [None] * self.in_interface_count,
+                'outinterfaces': [None] * self.out_interface_count,
+                'inhandles': metainfo[0x10:0x10 + self.in_handles_count],
+                'outhandles': metainfo[0x18:0x18 + self.out_handles_count],
+                'buffers': metainfo[8:8 + self.buffer_count],
+                'buffer_entry_sizes': [0]*self.buffer_count,
+                'pid': metainfo[2] == 1,
+            }
+        else:
+            # Pre-19.0.0 0x90 descriptor on stack
+            metainfo_size = 0x90
+            metainfo_bytes = uc.mem_read(arg, metainfo_size)
+            metainfo = list(struct.unpack('<' + 'I' * (metainfo_size/4), metainfo_bytes))
+
+            self.bytes_in = metainfo[8/4] - 0x10
+            assert 0 <= self.bytes_in <= 0x1000
+            self.bytes_out = metainfo[0x10/4] - 0x10
+            assert 0 <= self.bytes_out <= 0x1000
+            self.buffer_count = metainfo[0x18/4]
+            assert self.buffer_count < 20
+
+            self.in_interface_count = metainfo[0x1c/4]
+            self.out_interface_count = metainfo[0x20/4]
+            self.in_handles_count = metainfo[0x24/4]
+            self.out_handles_count = metainfo[0x28/4]
+
+            assert self.in_interface_count < 20
+            assert self.out_interface_count < 20
+            assert self.in_handles_count < 20
+            assert self.out_handles_count < 20
+
+            self.description = {
+                'inbytes': self.bytes_in,
+                'outbytes': self.bytes_out,
+                'ininterfaces': [None] * self.in_interface_count,
+                'outinterfaces': [None] * self.out_interface_count,
+                'inhandles': metainfo[0x4C/4:0x4C/4 + self.in_handles_count],
+                'outhandles': metainfo[0x6C/4:0x6C/4 + self.out_handles_count],
+                'buffers': metainfo[0x2c/4:0x2c/4 + self.buffer_count],
+                'pid': metainfo[0] == 1,
+            }
+
         self.description['lr'] = uc.reg_read(UC_ARM64_REG_LR)
 
         for i in ['outinterfaces', 'inhandles', 'outhandles', 'buffers', 'buffer_entry_sizes', 'pid', 'ininterfaces']:
